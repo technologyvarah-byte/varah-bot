@@ -1,248 +1,483 @@
-try { require('dotenv').config(); } catch (_) { }
+'use strict';
+
+require('dotenv').config();
 
 const crypto = require('crypto');
 const express = require('express');
 const axios = require('axios');
-const { initializeApp, cert } = require('firebase-admin/app');
+const OpenAI = require('openai');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
-// ==========================================
-// ⚙️ ENVIRONMENT VARIABLES
-// ==========================================
-const {
-  WHATSAPP_TOKEN,
-  PHONE_NUMBER_ID,
-  VERIFY_TOKEN,
-  APP_SECRET,
-  GRAPH_VERSION = 'v21.0',
-  TICKET_PREFIX = 'SR',
-  PORT = 3000,
-} = process.env;
+// -----------------------------------------------------------------------------
+// Environment and validation
+// -----------------------------------------------------------------------------
+const ENV = {
+  WHATSAPP_TOKEN: process.env.WHATSAPP_TOKEN,
+  PHONE_NUMBER_ID: process.env.PHONE_NUMBER_ID,
+  VERIFY_TOKEN: process.env.VERIFY_TOKEN,
+  APP_SECRET: process.env.APP_SECRET,
+  GRAPH_VERSION: process.env.GRAPH_VERSION || 'v21.0',
+  TICKET_PREFIX: process.env.TICKET_PREFIX || 'SR',
+  SALES_PREFIX: process.env.SALES_PREFIX || 'SL',
+  PORT: Number(process.env.PORT || 3000),
+  OPENAI_API_KEY: process.env.OPENAI_API_KEY,
+  OPENAI_MODEL: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+  AI_ENABLED: String(process.env.AI_ENABLED || 'true').toLowerCase() === 'true',
+  BUSINESS_NAME: process.env.BUSINESS_NAME || 'VARAH TECHNOLOGY',
+  BUSINESS_PHONE: process.env.BUSINESS_PHONE || '+91 9549308371',
+  BUSINESS_ADDRESS: process.env.BUSINESS_ADDRESS || 'Opp. Sagar Palace Hotel, Station Road, Bhinmal, Rajasthan',
+  SESSION_TTL_MS: Number(process.env.SESSION_TTL_MS || 6 * 60 * 60 * 1000),
+  MAX_BODY_BYTES: process.env.MAX_BODY_BYTES || '1mb',
+  LOG_MESSAGES: String(process.env.LOG_MESSAGES || 'false').toLowerCase() === 'true',
+};
 
-if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !VERIFY_TOKEN) {
-  console.error('❌ .env mein WHATSAPP_TOKEN, PHONE_NUMBER_ID aur VERIFY_TOKEN zaroori hain');
+for (const key of ['WHATSAPP_TOKEN', 'PHONE_NUMBER_ID', 'VERIFY_TOKEN', 'APP_SECRET']) {
+  if (!ENV[key]) {
+    console.error(`Missing required environment variable: ${key}`);
+    process.exit(1);
+  }
+}
+if (!Number.isInteger(ENV.PORT) || ENV.PORT < 1 || ENV.PORT > 65535) {
+  console.error('PORT must be a valid TCP port.');
   process.exit(1);
 }
 
-// ==========================================
-// 🔥 1. FIREBASE SETUP (Render & Local)
-// ==========================================
-let serviceAccount;
-
-// Agar Render par hain (Environment Variable set hai)
-if (process.env.FIREBASE_CREDENTIALS) {
-  try {
-    serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
-  } catch (error) {
-    console.error("❌ FIREBASE_CREDENTIALS parse error:", error);
-    process.exit(1);
+// -----------------------------------------------------------------------------
+// Firebase Admin. Keep existing Firestore collections/fields compatible.
+// -----------------------------------------------------------------------------
+function loadServiceAccount() {
+  if (process.env.FIREBASE_CREDENTIALS) {
+    try {
+      return JSON.parse(process.env.FIREBASE_CREDENTIALS);
+    } catch {
+      throw new Error('FIREBASE_CREDENTIALS is not valid JSON.');
+    }
   }
-} else {
-  // Agar local laptop par hain (File se read karein)
   try {
-    serviceAccount = require('./serviceAccountKey.json');
-  } catch (error) {
-    console.error("❌ Local 'serviceAccountKey.json' file nahi mili!");
-    process.exit(1);
+    return require('./serviceAccountKey.json');
+  } catch {
+    throw new Error('Set FIREBASE_CREDENTIALS or add serviceAccountKey.json locally.');
   }
 }
 
-initializeApp({ credential: cert(serviceAccount) });
+if (!getApps().length) {
+  initializeApp({ credential: cert(loadServiceAccount()) });
+}
 const db = getFirestore();
-
 const app = express();
-app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
+app.disable('x-powered-by');
+app.use(express.json({
+  limit: ENV.MAX_BODY_BYTES,
+  verify: (req, _res, buffer) => { req.rawBody = Buffer.from(buffer); },
+}));
 
-// 🔥 REQUEST LOGGER
-app.use((req, res, next) => {
-  console.log(`\n➡️  ${req.method} ${req.originalUrl}`);
-  if (req.method === 'POST') {
-    console.log('📦 Webhook POST body aaya:', JSON.stringify(req.body, null, 2));
+const openai = ENV.OPENAI_API_KEY ? new OpenAI({ apiKey: ENV.OPENAI_API_KEY }) : null;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+const now = () => FieldValue.serverTimestamp();
+const clean = (value, max = 1000) => String(value || '').trim().slice(0, max);
+const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
+const isGreeting = (s) => /^(hi|hii+|hello|hey|namaste|नमस्ते|हेलो)$/i.test(s);
+const isMenu = (s) => /^(menu|0|start|शुरू|मेन्यू)$/i.test(s);
+const isHuman = (s) => /^(agent|human|staff|person|कर्मचारी|इंसान|सपोर्ट)$/i.test(s);
+
+const MENU_TEXT =
+  `Namaste! 🙏 *${ENV.BUSINESS_NAME}* mein aapka swagat hai.\n` +
+  `Welcome to ${ENV.BUSINESS_NAME} – CCTV & Security Solutions.\n\n` +
+  `Aapko kis cheez mein madad chahiye? / How can we help?\n\n` +
+  `*1.* CCTV Sales / New Installation\n` +
+  `*2.* CCTV Repair / Service Request\n` +
+  `*3.* Existing Ticket Status\n` +
+  `*4.* Product / Technical Support\n` +
+  `*5.* Quotation / Price Enquiry\n` +
+  `*6.* Talk to Support Team\n\n` +
+  `Reply with 1–6. Type *MENU* anytime to return here.`;
+
+function textOf(message) {
+  if (message.type === 'text') return clean(message.text?.body, 4000);
+  if (message.type === 'button') return clean(message.button?.text, 1000);
+  if (message.type === 'interactive') {
+    const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+    return clean(reply?.id || reply?.title, 1000);
   }
-  next();
-});
+  if (message.type === 'image') return '[Customer sent an image]';
+  if (message.type === 'video') return '[Customer sent a video]';
+  if (message.type === 'document') return '[Customer sent a document]';
+  if (message.type === 'audio') return '[Customer sent audio]';
+  if (message.type === 'location') return '[Customer shared a location]';
+  return '';
+}
 
-app.get('/', (_req, res) => res.send('Varah CCTV Bot Server is Running OK ✅'));
+function validSignature(req) {
+  const signature = req.get('x-hub-signature-256') || '';
+  if (!/^sha256=[a-f0-9]{64}$/i.test(signature) || !req.rawBody) return false;
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', ENV.APP_SECRET)
+    .update(req.rawBody)
+    .digest('hex');
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
 
-// ==========================================
-// 🔗 WEBHOOK VERIFICATION (GET)
-// ==========================================
+async function sendMessage(to, body) {
+  const recipient = normalizePhone(to);
+  if (!recipient) throw new Error('Invalid WhatsApp recipient.');
+  const response = await axios.post(
+    `https://graph.facebook.com/${ENV.GRAPH_VERSION}/${ENV.PHONE_NUMBER_ID}/messages`,
+    {
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: recipient,
+      type: 'text',
+      text: { preview_url: false, body: clean(body, 4096) },
+    },
+    {
+      timeout: 15000,
+      headers: {
+        Authorization: `Bearer ${ENV.WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  return response.data;
+}
+
+async function safeSend(to, body) {
+  try {
+    return await sendMessage(to, body);
+  } catch (error) {
+    console.error('WhatsApp send failed:', error.response?.data || error.message);
+    return null;
+  }
+}
+
+async function nextTicket(kind) {
+  const isSales = kind === 'sales';
+  const prefix = isSales ? ENV.SALES_PREFIX : ENV.TICKET_PREFIX;
+  const counterRef = db.collection('counters').doc(isSales ? 'waSalesLeads' : 'waLeads');
+  const number = await db.runTransaction(async (tx) => {
+    const snap = await tx.get(counterRef);
+    const next = (snap.exists && Number.isFinite(snap.data().n) ? snap.data().n : 1000) + 1;
+    tx.set(counterRef, { n: next, updatedAt: now() }, { merge: true });
+    return next;
+  });
+  return `${prefix}-${number}`;
+}
+
+async function saveLead({ from, profileName, details, type, messageId, category }) {
+  const ticketId = await nextTicket(type);
+  const lead = {
+    ticketId,
+    phone: normalizePhone(from),
+    name: clean(profileName, 120),
+    message: clean(details, 3000),
+    type: type === 'sales' ? 'sales' : 'service',
+    category: clean(category, 80),
+    status: 'new',
+    source: 'whatsapp',
+    waMessageId: messageId || '',
+    createdAt: now(),
+    updatedAt: now(),
+  };
+  const doc = await db.collection('leads').add(lead);
+  return { ticketId, leadId: doc.id, lead };
+}
+
+async function updateSession(ref, data) {
+  await ref.set({ ...data, updatedAt: now() }, { merge: true });
+}
+
+async function setMenu(from, ref, intro = '') {
+  await updateSession(ref, { step: 'menu', type: null, collected: {} });
+  await safeSend(from, `${intro ? intro + '\n\n' : ''}${MENU_TEXT}`);
+}
+
+async function findTicket(ticketId, phone) {
+  const snap = await db.collection('leads')
+    .where('ticketId', '==', clean(ticketId, 40))
+    .limit(1)
+    .get();
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  const lead = doc.data();
+  // Do not disclose a ticket to a different WhatsApp number.
+  if (normalizePhone(lead.phone) !== normalizePhone(phone)) return null;
+  return lead;
+}
+
+// -----------------------------------------------------------------------------
+// Optional AI: intent classification and short bilingual replies.
+// AI is constrained to routing; it cannot create/update records by itself.
+// -----------------------------------------------------------------------------
+async function classifyWithAI(text, currentStep) {
+  if (!ENV.AI_ENABLED || !openai || !text || text.length > 1500) return null;
+  try {
+    const completion = await openai.chat.completions.create({
+      model: ENV.OPENAI_MODEL,
+      temperature: 0,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You classify customer messages for an Indian CCTV company. Return JSON only: ' +
+            '{"intent":"sales|service|status|technical|quotation|human|menu|other",' +
+            '"language":"hi|en|mixed","summary":"short plain summary","reply":"brief helpful bilingual reply or empty"}. ' +
+            'Do not invent prices, warranties, availability, ticket status, or claim an action was completed. ' +
+            'If uncertain use intent other. Current flow step: ' + currentStep,
+        },
+        { role: 'user', content: text },
+      ],
+    });
+    const parsed = JSON.parse(completion.choices?.[0]?.message?.content || '{}');
+    const allowed = new Set(['sales', 'service', 'status', 'technical', 'quotation', 'human', 'menu', 'other']);
+    if (!allowed.has(parsed.intent)) return null;
+    return {
+      intent: parsed.intent,
+      language: ['hi', 'en', 'mixed'].includes(parsed.language) ? parsed.language : 'mixed',
+      summary: clean(parsed.summary, 300),
+      reply: clean(parsed.reply, 700),
+    };
+  } catch (error) {
+    console.error('AI classification failed; using menu rules:', error.message);
+    return null;
+  }
+}
+
+function intentToChoice(intent) {
+  return ({
+    sales: '1',
+    service: '2',
+    status: '3',
+    technical: '4',
+    quotation: '5',
+    human: '6',
+    menu: 'menu',
+  })[intent] || null;
+}
+
+// -----------------------------------------------------------------------------
+// Message workflow
+// -----------------------------------------------------------------------------
+async function handleMessage(message, profileName) {
+  const from = normalizePhone(message.from);
+  if (!from || !message.id) return;
+
+  // Atomic idempotency: Firestore create fails if the document already exists.
+  const processedRef = db.collection('wa_processed').doc(message.id);
+  try {
+    await processedRef.create({ at: now(), from });
+  } catch (error) {
+    if (error.code === 6 || error.code === 'already-exists') return;
+    throw error;
+  }
+
+  const text = textOf(message);
+  const low = text.toLowerCase();
+  const sessionRef = db.collection('whatsapp_sessions').doc(from);
+  const sessionSnap = await sessionRef.get();
+  let session = sessionSnap.exists ? sessionSnap.data() : null;
+  if (session?.updatedAt?.toMillis &&
+      Date.now() - session.updatedAt.toMillis() > ENV.SESSION_TTL_MS) {
+    session = null;
+    await sessionRef.delete().catch(() => {});
+  }
+
+  if (isMenu(low) || isGreeting(low) || !session) {
+    await setMenu(from, sessionRef, isGreeting(low) ? 'Namaste! / Hello!' : '');
+    return;
+  }
+
+  if (isHuman(low)) {
+    await db.collection('wa_handoffs').add({
+      phone: from, name: clean(profileName, 120), status: 'open',
+      source: 'whatsapp', createdAt: now(),
+    });
+    await safeSend(from,
+      'Aapki request hamari support team ko bhej di gayi hai. ✅\n' +
+      'Our support team will contact you soon. Working hours ke dauran reply milega.\n\nType MENU for main menu.');
+    return;
+  }
+
+  // While waiting for a ticket number, validate ownership before showing status.
+  if (session.step === 'ticket_status') {
+    const ticket = await findTicket(text, from);
+    if (!ticket) {
+      await safeSend(from, 'Ticket nahi mila, ya yeh number is WhatsApp account se match nahi karta. Kripya sahi Ticket Number bhejein. / Ticket not found. Send MENU to return.');
+      return;
+    }
+    await safeSend(from,
+      `🎫 *${ticket.ticketId}*\nStatus: *${clean(ticket.status || 'new', 40)}*\n` +
+      `Type: ${ticket.type === 'sales' ? 'Sales Enquiry' : 'Service Request'}\n` +
+      `Our team will contact you for the latest update.`);
+    await setMenu(from, sessionRef);
+    return;
+  }
+
+  // AI intent detection when user writes naturally instead of choosing a number.
+  if (session.step === 'menu' && !/^[1-6]$/.test(low)) {
+    const ai = await classifyWithAI(text, session.step);
+    const choice = ai && intentToChoice(ai.intent);
+    if (choice) {
+      if (choice === 'menu') return setMenu(from, sessionRef);
+      await updateSession(sessionRef, {
+        step: choice === '3' ? 'ticket_status' : choice === '4' ? 'technical' : choice === '6' ? 'human' : 'ask_details',
+        type: ['1', '5'].includes(choice) ? 'sales' : 'service',
+        category: choice,
+      });
+      if (choice === '3') return safeSend(from, 'Kripya apna Ticket Number bhejein. / Please send your Ticket Number.');
+      if (choice === '4') return safeSend(from, 'Apni CCTV problem aur device model bhejein. / Please share the issue and device model.');
+      if (choice === '6') return safeSend(from, 'Apna message bhejein. Hamari team ko notify kiya jayega. / Send your message for our support team.');
+      return askDetails(from, choice);
+    }
+    await safeSend(from, ai?.reply || 'Kripya 1 se 6 mein se option chunein. / Please choose an option from 1 to 6.');
+    return;
+  }
+
+  const choice = low;
+  if (session.step === 'menu') {
+    if (choice === '3') {
+      await updateSession(sessionRef, { step: 'ticket_status' });
+      await safeSend(from, 'Kripya apna Ticket Number bhejein. / Please send your Ticket Number.');
+      return;
+    }
+    if (choice === '4') {
+      await updateSession(sessionRef, { step: 'technical', type: 'service' });
+      await safeSend(from, 'Apni CCTV problem aur device model bhejein. / Please share your issue and device model.');
+      return;
+    }
+    if (choice === '6') {
+      await updateSession(sessionRef, { step: 'human' });
+      await safeSend(from, 'Apna message bhejein. Hamari team ko notify kiya jayega. / Send your message for our support team.');
+      return;
+    }
+    if (['1', '2', '5'].includes(choice)) {
+      const type = choice === '1' || choice === '5' ? 'sales' : 'service';
+      await updateSession(sessionRef, { step: 'ask_details', type, category: choice });
+      return askDetails(from, choice);
+    }
+    await safeSend(from, 'Invalid option. Kripya 1 se 6 tak ka option chunein. / Please choose 1 to 6.');
+    return;
+  }
+
+  if (session.step === 'human') {
+    await db.collection('wa_handoffs').add({
+      phone: from, name: clean(profileName, 120), message: text,
+      status: 'open', source: 'whatsapp', createdAt: now(),
+    });
+    await safeSend(from, 'Dhanyawad! Aapka message support team ko bhej diya gaya hai. ✅');
+    await setMenu(from, sessionRef);
+    return;
+  }
+
+  if (session.step === 'technical') {
+    const result = await saveLead({ from, profileName, details: text, type: 'service', messageId: message.id, category: 'technical_support' });
+    await safeSend(from, `Technical support request registered. ✅\nTicket: *${result.ticketId}*\nHamari team aapse sampark karegi. / Our team will contact you.`);
+    await setMenu(from, sessionRef);
+    return;
+  }
+
+  if (session.step === 'ask_details') {
+    if (text.length < 8 || isGreeting(low) || isMenu(low)) {
+      await safeSend(from, 'Kripya thodi aur details bhejein (naam, city/location aur requirement/problem). / Please include your name, location and requirement/problem.');
+      return;
+    }
+    const result = await saveLead({
+      from, profileName, details: text,
+      type: session.type || 'service',
+      messageId: message.id,
+      category: session.category === '5' ? 'quotation' : session.category === '1' ? 'new_installation' : session.category === '2' ? 'repair_service' : 'general',
+    });
+    const confirmation = `Dhanyawad ${clean(profileName, 80)}! Aapki request darj ho gayi hai. ✅\nThank you! Your request has been registered.\n\n🎫 Ticket: *${result.ticketId}*\nHamari team jald sampark karegi. / Our team will contact you soon.\n\nType *MENU* for more options.`;
+    await safeSend(from, confirmation);
+    await setMenu(from, sessionRef);
+    return;
+  }
+
+  await setMenu(from, sessionRef, 'Let us start again. / Chaliye dobara shuru karte hain.');
+}
+
+async function askDetails(from, choice) {
+  const prompts = {
+    '1': 'Naya CCTV Setup / Sales 🛒\nKripya Naam, Location, kitne cameras chahiye aur indoor/outdoor requirement bhejein.\nPlease share your name, location, number of cameras and requirement.',
+    '2': 'CCTV Repair / Service 🛠️\nKripya Naam, Location, CCTV/DVR model aur problem bhejein.\nPlease share your name, location, device model and issue.',
+    '5': 'Quotation / Price Enquiry 🧾\nKripya Naam, Location, camera quantity aur requirement bhejein. Team quotation ke liye sampark karegi.',
+  };
+  await safeSend(from, prompts[choice] || prompts['2']);
+}
+
+// -----------------------------------------------------------------------------
+// Webhook endpoints
+// -----------------------------------------------------------------------------
+app.get('/', (_req, res) => res.status(200).send('VARAH TECHNOLOGY WhatsApp Bot is running ✅'));
+app.get('/health', (_req, res) => res.status(200).json({ ok: true, service: 'varah-whatsapp-bot' }));
+
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    console.log('✅ Webhook verified by Meta');
+  if (mode === 'subscribe' && token === ENV.VERIFY_TOKEN && challenge) {
     return res.status(200).type('text/plain').send(String(challenge));
   }
-  console.log('❌ Webhook verify fail');
-  res.sendStatus(403);
+  return res.sendStatus(403);
 });
 
-// ==========================================
-// 🔒 SECURITY CHECK
-// ==========================================
-function validSignature(req) {
-  if (!APP_SECRET) return true;
-  const got = Buffer.from(req.get('x-hub-signature-256') || '');
-  const want = Buffer.from('sha256=' + crypto.createHmac('sha256', APP_SECRET).update(req.rawBody || '').digest('hex'));
-  return got.length === want.length && crypto.timingSafeEqual(got, want);
-}
-
-// ==========================================
-// 📩 RECEIVE MESSAGES (POST)
-// ==========================================
 app.post('/webhook', (req, res) => {
-  if (!validSignature(req)) {
-    console.log('❌ Signature galat - request ignore');
-    return res.sendStatus(401);
-  }
-  
-  // Meta ko turant 200 OK (Render timeout se bachne ke liye)
-  res.sendStatus(200);
+  if (!validSignature(req)) return res.sendStatus(401);
 
+  // Acknowledge Meta immediately. Process asynchronously.
+  res.sendStatus(200);
   const body = req.body || {};
   if (body.object !== 'whatsapp_business_account') return;
 
-  (async () => {
+  setImmediate(async () => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value || {};
-        const name = value.contacts && value.contacts[0] && value.contacts[0].profile ? value.contacts[0].profile.name : '';
+        const profileName = clean(value.contacts?.[0]?.profile?.name, 120);
         for (const message of value.messages || []) {
           try {
-            await handleMessage(message, name);
-          } catch (err) {
-            console.error('❌ Message handle error:', err);
+            await handleMessage(message, profileName);
+          } catch (error) {
+            console.error('Message processing failed:', error.response?.data || error.message);
+          }
+        }
+        // Delivery/read statuses can be persisted for CRM message tracking.
+        for (const status of value.statuses || []) {
+          try {
+            await db.collection('wa_message_status').doc(status.id).set({
+              id: status.id,
+              status: status.status,
+              recipientId: status.recipient_id || '',
+              timestamp: status.timestamp || '',
+              updatedAt: now(),
+            }, { merge: true });
+          } catch (error) {
+            console.error('Status persistence failed:', error.message);
           }
         }
       }
     }
-  })();
+  });
 });
 
-// ==========================================
-// 🧠 BOT LOGIC & STATE MANAGEMENT
-// ==========================================
-const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours session expiry
+app.use((error, _req, res, _next) => {
+  console.error('Express error:', error.message);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
-function textOf(m) {
-  if (m.type === 'text' && m.text) return String(m.text.body || '').trim();
-  if (m.type === 'button' && m.button) return String(m.button.text || '').trim();
-  if (m.type === 'interactive' && m.interactive) {
-    const r = m.interactive.button_reply || m.interactive.list_reply;
-    return r ? String(r.title || r.id || '').trim() : '';
-  }
-  return '';
+const server = app.listen(ENV.PORT, () => {
+  console.log(`VARAH WhatsApp Bot listening on ${ENV.PORT}`);
+});
+
+function shutdown(signal) {
+  console.log(`${signal} received; shutting down`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10000).unref();
 }
-
-const MENU_TEXT = 'Namaste! *Varah Technology (CCTV Solutions)* mein aapka swagat hai. 🙏\n\nKaise madad karein?\n*1.* Naya CCTV Setup / Sales\n*2.* CCTV Repair / Service Request\n\nKripya *1* ya *2* likh kar bhejein.';
-
-async function nextTicket() {
-  const ref = db.collection('counters').doc('waLeads');
-  const n = await db.runTransaction(async (t) => {
-    const s = await t.get(ref);
-    const v = (s.exists ? s.data().n : 1000) + 1;
-    t.set(ref, { n: v });
-    return v;
-  });
-  return `${TICKET_PREFIX}-${n}`;
-}
-
-async function handleMessage(message, profileName) {
-  const from = message.from;
-
-  // Duplicate message check
-  try {
-    await db.collection('wa_processed').doc(message.id).create({ at: FieldValue.serverTimestamp(), from });
-  } catch (e) {
-    if (e.code === 6) { console.log('↩️ Duplicate message ignore:', message.id); return; }
-    throw e;
-  }
-
-  const text = textOf(message);
-  const low = text.toLowerCase().trim();
-  console.log(`📩 ${from} (${message.type}): ${text}`);
-
-  const ref = db.collection('whatsapp_sessions').doc(from);
-  const snap = await ref.get();
-  let s = snap.exists ? snap.data() : null;
-  if (s && s.updatedAt && Date.now() - s.updatedAt.toMillis() > SESSION_TTL_MS) s = null;
-
-  // 1. Initial Greeting / Reset / Menu
-  if (!s || s.step === 'start' || low === 'menu' || low === '0' || low === 'hi' || low === 'hello') {
-    await sendMessage(from, MENU_TEXT);
-    await ref.set({ step: 'menu', updatedAt: FieldValue.serverTimestamp() });
-    return;
-  }
-
-  // 2. Menu Selection
-  if (s.step === 'menu') {
-    if (low === '1' || low.startsWith('sales')) {
-      await ref.set({ step: 'ask_details', type: 'sales', updatedAt: FieldValue.serverTimestamp() });
-      await sendMessage(from, 'Aapne *Naya CCTV Setup / Sales* chuna hai. 🛒\n\nKripya apna *Naam, City, aur Kitne Camera* chahiye (approx) likh kar bhejein.\n\n_(Udaharan: Rahul Sharma - Noida - 4 Camera lagwane hain)_');
-    } else if (low === '2' || low.startsWith('service')) {
-      await ref.set({ step: 'ask_details', type: 'service', updatedAt: FieldValue.serverTimestamp() });
-      await sendMessage(from, 'Aapne *CCTV Repair / Service* chuna hai. 🛠️\n\nKripya apna *Naam, Location, aur Problem* short mein likh kar bhejein.\n\n_(Udaharan: Amit - Andheri - DVR on nahi ho raha)_');
-    } else {
-      await sendMessage(from, 'Kshama kijiye, main samajh nahi paaya.\nKripya sahi option chunein. *1* ya *2* likhein.');
-    }
-    return;
-  }
-
-  // 3. Detail Collection & Validation
-  if (s.step === 'ask_details') {
-    // 🚨 VALIDATION (Hi/Hello/Chote messages ko block karne ke liye)
-    const invalidKeywords = ['hi', 'hello', 'hey', 'hii', 'ok', 'hmm', '1', '2'];
-    
-    if (!text || text.length < 5 || invalidKeywords.includes(low)) {
-      await sendMessage(from, `Kshama kijiye, main aapki details samajh nahi paaya. 😔\n\nKripya apna *Naam, City aur Requirement* ek sath likh kar bhejein.\n\n_(Udaharan: Vikas - Delhi - 2 Camera kharab hain)_`);
-      return; // Yahan return kar diya, taaki ticket generate na ho
-    }
-
-    // Agar details sahi hain, toh Ticket generate karo
-    const ticketId = await nextTicket();
-    
-    // Save to Firebase Firestore
-    await db.collection('leads').add({
-      ticketId,
-      phone: from,
-      name: profileName || '',
-      message: text,
-      type: s.type || 'service',
-      status: 'new',
-      source: 'whatsapp',
-      waMessageId: message.id,
-      createdAt: FieldValue.serverTimestamp(),
-    });
-    
-    // Send Ticket Confirmation
-    await sendMessage(from, `Dhanyawad ${profileName ? profileName : ''}! Aapki request safaltapoorvak darj kar li gayi hai. ✅\n\n🎫 Aapka Ticket Number: *${ticketId}*\n\nHamari team jald hi aapse sampark karegi. Kisi anya sahayata ke liye *Menu* likhein.`);
-    
-    // Session clear karo taaki next time naya flow chale
-    await ref.delete(); 
-    console.log(`✅ Ticket saved in DB: ${ticketId}`);
-  }
-}
-
-// ==========================================
-// 📤 SEND MESSAGE HELPER
-// ==========================================
-async function sendMessage(to, text) {
-  try {
-    await axios.post(
-      `https://graph.facebook.com/${GRAPH_VERSION}/${PHONE_NUMBER_ID}/messages`,
-      { messaging_product: 'whatsapp', to, type: 'text', text: { body: text } },
-      { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' } }
-    );
-  } catch (error) {
-    const d = error.response && error.response.data;
-    console.error('❌ Message send fail:', d ? JSON.stringify(d) : error.message);
-  }
-}
-
-// ==========================================
-// 🚀 START SERVER
-// ==========================================
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
