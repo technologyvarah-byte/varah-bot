@@ -21,7 +21,20 @@ if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !VERIFY_TOKEN) {
   process.exit(1);
 }
 
-initializeApp({ credential: cert(require('./serviceAccountKey.json')) });
+// ==========================================
+// 1. FIREBASE SETUP (Render & Local Dono Ke Liye)
+// ==========================================
+let serviceAccount;
+
+if (process.env.FIREBASE_CREDENTIALS) {
+  // Agar Render par hain, toh Environment Variable se key uthayein
+  serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+} else {
+  // Agar local laptop par hain, toh file se key uthayein
+  serviceAccount = require('./serviceAccountKey.json');
+}
+
+initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
 
 const app = express();
