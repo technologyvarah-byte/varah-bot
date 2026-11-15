@@ -22,20 +22,35 @@ if (!WHATSAPP_TOKEN || !PHONE_NUMBER_ID || !VERIFY_TOKEN) {
 }
 
 // ==========================================
-// 1. FIREBASE SETUP (Render & Local Dono Ke Liye)
+// 🔥 1. FIREBASE SETUP (Render & Local)
 // ==========================================
 let serviceAccount;
+
+// Agar Render par hain (Environment Variable set hai)
 if (process.env.FIREBASE_CREDENTIALS) {
-  serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+  try {
+    serviceAccount = JSON.parse(process.env.FIREBASE_CREDENTIALS);
+  } catch (error) {
+    console.error("❌ FIREBASE_CREDENTIALS parse error:", error);
+    process.exit(1);
+  }
 } else {
-  serviceAccount = require('./serviceAccountKey.json');
+  // Agar local laptop par hain (File se read karein)
+  try {
+    serviceAccount = require('./serviceAccountKey.json');
+  } catch (error) {
+    console.error("❌ Local 'serviceAccountKey.json' file nahi mili!");
+    process.exit(1);
+  }
 }
+
 initializeApp({ credential: cert(serviceAccount) });
 const db = getFirestore();
+
 const app = express();
 app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
-// 🔥 REQUEST LOGGER: Har request terminal mein dikhegi
+// 🔥 REQUEST LOGGER
 app.use((req, res, next) => {
   console.log(`\n➡️  ${req.method} ${req.originalUrl}`);
   if (req.method === 'POST') {
@@ -54,7 +69,7 @@ app.get('/webhook', (req, res) => {
     console.log('✅ Webhook verified by Meta');
     return res.status(200).type('text/plain').send(String(challenge));
   }
-  console.log('❌ Webhook verify fail (token mismatch ya galat mode)');
+  console.log('❌ Webhook verify fail');
   res.sendStatus(403);
 });
 
